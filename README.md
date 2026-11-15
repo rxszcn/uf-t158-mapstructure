@@ -47,6 +47,15 @@ For usage and examples see the [documentation](https://pkg.go.dev/mod/github.com
 
 The `Decode` function has examples associated with it there.
 
+## Decoding into interfaces
+
+When a field of an interface type (such as `any`) already holds a value and is
+decoded again incrementally, scalar values of a different concrete type replace
+the whole held value (the interface is not locked to its previous scalar type),
+while structs, maps and slices keep their incremental merge behavior. See the
+"Decoding into Interfaces" section of the package documentation for the full
+contract.
+
 ## But Why?!
 
 Go offers fantastic standard libraries for decoding formats such as JSON.

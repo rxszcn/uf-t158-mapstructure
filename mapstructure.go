@@ -192,6 +192,28 @@
 //
 // See the Unmarshaler interface documentation for more details.
 //
+// # Decoding into Interfaces
+//
+// A field or value of an interface type (including any) that does not yet
+// hold a value simply stores the decoded input, adopting its concrete type.
+//
+// When the interface already holds a concrete value, decoding distinguishes
+// between scalar and composite held values:
+//
+//   - Scalar values (bools, strings, numbers, complexes). If the incoming
+//     value's concrete type is assignable to the type currently held, the
+//     value is decoded in place and overwritten. If it is a different scalar
+//     type, the whole held value is replaced by the new one, exactly as if the
+//     same payload had been decoded into a fresh target. An interface is
+//     therefore never locked to the scalar type of a previous incremental
+//     decode. A concrete (non-interface) field still rejects an incompatible
+//     scalar with an UnconvertibleTypeError and keeps its old value; only
+//     interface holders are replaced.
+//   - Composite values (structs, maps, slices, pointers). The existing
+//     recursive, incremental merge behavior is preserved: the input is
+//     decoded into the value already held, and held keys or fields that are
+//     absent from the input are retained.
+//
 // # Other Configuration
 //
 // mapstructure is highly configurable. See the DecoderConfig struct
@@ -672,6 +694,27 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 func (d *Decoder) decodeBasic(name string, data any, val reflect.Value) error {
 	if val.IsValid() && val.Elem().IsValid() {
 		elem := val.Elem()
+
+		// The interface already holds a concrete value. When a scalar input
+		// is not assignable to that concrete type, in-place decoding would
+		// fail with an UnconvertibleTypeError and leave the stale value in
+		// place, silently locking the interface to the type of its previous
+		// value across incremental decodes. An interface's contract is to
+		// hold any value, so replace the whole scalar value instead. This
+		// mirrors decoding into a fresh target, while assignable inputs keep
+		// the in-place (incremental merge) path below unchanged.
+		//
+		// Only scalar kinds are replaced. Maps, slices, structs and pointers
+		// keep their existing recursive handling, so nested interface holders
+		// (e.g. an interface holding *Basic decoded from a map) and container
+		// incremental merge semantics are untouched.
+		dataVal := reflect.ValueOf(data)
+		if isScalarKind(dataVal.Kind()) &&
+			!dataVal.Type().AssignableTo(elem.Type()) &&
+			val.CanSet() {
+			val.Set(dataVal)
+			return nil
+		}
 
 		// If we can't address this element, then its not writable. Instead,
 		// we make a copy of the value (which is a pointer and therefore
@@ -1817,6 +1860,23 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.IsNil()
 	}
 	return false
+}
+
+// isScalarKind reports whether kind is a basic scalar kind that may be
+// stored directly in an interface holder (as opposed to containers,
+// structs and pointers which retain their recursive decoding path).
+func isScalarKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Bool,
+		reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return true
+	default:
+		return false
+	}
 }
 
 func getKind(val reflect.Value) reflect.Kind {

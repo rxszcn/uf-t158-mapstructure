@@ -515,6 +515,259 @@ func TestBasic_interfaceStructNonPtr(t *testing.T) {
 	}
 }
 
+// scalarInterfaceHolder is a struct whose field is a bare interface holder,
+// used to exercise incremental (multi-round) decoding into a value that
+// already holds a concrete scalar type.
+type scalarInterfaceHolder struct {
+	V any
+}
+
+// TestBasic_InterfaceScalarHolder_SameType pins the matching form of the
+// scalar interface-holder contract: when the incoming value has the same
+// concrete type as the value already held, decoding stays in-place and the
+// field is simply overwritten.
+func TestBasic_InterfaceScalarHolder_SameType(t *testing.T) {
+	t.Parallel()
+
+	result := &scalarInterfaceHolder{}
+	if err := Decode(map[string]any{"V": "first"}, result); err != nil {
+		t.Fatalf("first decode got an err: %s", err)
+	}
+
+	// Second round, same concrete type: ordinary overwrite, no error.
+	if err := Decode(map[string]any{"V": "second"}, result); err != nil {
+		t.Fatalf("second decode got an err: %s", err)
+	}
+
+	if result.V != "second" {
+		t.Fatalf("expected held value to be overwritten with \"second\", got %#v", result.V)
+	}
+}
+
+// TestBasic_InterfaceScalarHolder_TypeMismatch pins the mismatching form:
+// a scalar interface holder must not be locked to the concrete type of its
+// previous value. The new scalar replaces the whole held value, matching the
+// result of decoding the same payload into a fresh target.
+func TestBasic_InterfaceScalarHolder_TypeMismatch(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		first any
+		second any
+	}{
+		{"string then int", "hello", 42},
+		{"int then string", 7, "hello"},
+		{"bool then float", true, 3.14},
+		{"float then bool", 1.5, false},
+		{"string then bool", "on", true},
+		{"int then complex", 1, complex(2, 3)},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Incremental path: same holder across two rounds.
+			result := &scalarInterfaceHolder{}
+			if err := Decode(map[string]any{"V": tc.first}, result); err != nil {
+				t.Fatalf("first decode got an err: %s", err)
+			}
+			if err := Decode(map[string]any{"V": tc.second}, result); err != nil {
+				t.Fatalf("second decode got an err: %s", err)
+			}
+
+			// Fresh path: the second payload decoded into a new target.
+			fresh := &scalarInterfaceHolder{}
+			if err := Decode(map[string]any{"V": tc.second}, fresh); err != nil {
+				t.Fatalf("fresh decode got an err: %s", err)
+			}
+
+			if !reflect.DeepEqual(result.V, fresh.V) {
+				t.Fatalf("incremental result %#v differs from fresh result %#v", result.V, fresh.V)
+			}
+			if !reflect.DeepEqual(result.V, tc.second) {
+				t.Fatalf("expected held value to be replaced by %#v, got %#v", tc.second, result.V)
+			}
+		})
+	}
+}
+
+// TestBasic_InterfaceScalarHolder_MismatchContrastsNonHolder documents the
+// contrast: replacement only applies to interface holders. A concrete
+// (non-interface) field still rejects a mismatched scalar with an
+// UnconvertibleTypeError, so the failure semantics of ordinary fields are
+// unchanged.
+func TestBasic_InterfaceScalarHolder_MismatchContrastsNonHolder(t *testing.T) {
+	t.Parallel()
+
+	type concreteHolder struct {
+		V string
+	}
+
+	result := &concreteHolder{V: "hello"}
+	err := Decode(map[string]any{"V": 42}, result)
+	if err == nil {
+		t.Fatal("expected an error decoding an int into a string field, got nil")
+	}
+
+	var unconvertible *UnconvertibleTypeError
+	if !errors.As(err, &unconvertible) {
+		t.Fatalf("expected *UnconvertibleTypeError, got %T: %s", err, err)
+	}
+
+	// The concrete field keeps its previous value on failure.
+	if result.V != "hello" {
+		t.Fatalf("expected string field to keep \"hello\", got %#v", result.V)
+	}
+}
+
+// TestBasic_InterfaceScalarHolder_WeaklyTyped pins weak-mode behavior for a
+// held scalar whose type changes. Because the mismatching scalar replaces
+// the holder instead of being forced through the old concrete type, the new
+// value is stored as-is, exactly as it would be in a fresh target.
+func TestBasic_InterfaceScalarHolder_WeaklyTyped(t *testing.T) {
+	t.Parallel()
+
+	result := &scalarInterfaceHolder{}
+	decoder, err := NewDecoder(&DecoderConfig{
+		WeaklyTypedInput: true,
+		Result:           result,
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder got an err: %s", err)
+	}
+
+	if err := decoder.Decode(map[string]any{"V": "hello"}); err != nil {
+		t.Fatalf("first decode got an err: %s", err)
+	}
+	if err := decoder.Decode(map[string]any{"V": 42}); err != nil {
+		t.Fatalf("second decode got an err: %s", err)
+	}
+
+	if result.V != 42 {
+		t.Fatalf("expected weakly-typed mismatch to replace holder with 42, got %#v", result.V)
+	}
+}
+
+// TestBasic_InterfaceScalarHolder_NestedStructUntouched ensures that an
+// interface holding a pointer-to-struct still decodes recursively into the
+// held struct rather than replacing it with the raw input map.
+func TestBasic_InterfaceScalarHolder_NestedStructUntouched(t *testing.T) {
+	t.Parallel()
+
+	result := &scalarInterfaceHolder{V: &Basic{}}
+	err := Decode(
+		map[string]any{"V": map[string]any{"vstring": "bar"}},
+		result,
+	)
+	if err != nil {
+		t.Fatalf("got an err: %s", err)
+	}
+
+	held, ok := result.V.(*Basic)
+	if !ok {
+		t.Fatalf("expected held value to remain *Basic, got %T", result.V)
+	}
+	if held.Vstring != "bar" {
+		t.Fatalf("expected nested Vstring \"bar\", got %#v", held.Vstring)
+	}
+}
+
+// TestBasic_InterfaceScalarHolder_HookCalls pins the decode-hook invocation
+// convention: same-type (in-place) and empty-interface decodes keep their
+// exact pre-existing call signatures, while a mismatching scalar replacement
+// invokes the hook only once at the interface boundary (no recursive call
+// against the stale concrete type).
+func TestBasic_InterfaceScalarHolder_HookCalls(t *testing.T) {
+	t.Parallel()
+
+	type hookCall struct {
+		from string
+		to   string
+	}
+
+	collect := func() (DecodeHookFunc, *[]hookCall) {
+		calls := new([]hookCall)
+		hook := func(from, to reflect.Type, v any) (any, error) {
+			*calls = append(*calls, hookCall{from: from.String(), to: to.String()})
+			return v, nil
+		}
+		return hook, calls
+	}
+
+	// Empty interface, first round: hook sees the input kind against the
+	// interface, then the concrete scalar decode.
+	hook, calls := collect()
+	empty := &scalarInterfaceHolder{}
+	decoder, err := NewDecoder(&DecoderConfig{DecodeHook: hook, Result: empty})
+	if err != nil {
+		t.Fatalf("NewDecoder got an err: %s", err)
+	}
+	if err := decoder.Decode(map[string]any{"V": "hello"}); err != nil {
+		t.Fatalf("decode got an err: %s", err)
+	}
+	found := false
+	for _, c := range *calls {
+		if c.from == "string" && c.to == "interface {}" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a string -> interface {} hook call, got %#v", *calls)
+	}
+
+	// Held scalar, same type: in-place recursion still produces the
+	// string -> *string and string -> string hook calls.
+	hook, calls = collect()
+	decoder, err = NewDecoder(&DecoderConfig{DecodeHook: hook, Result: empty})
+	if err != nil {
+		t.Fatalf("NewDecoder got an err: %s", err)
+	}
+	if err := decoder.Decode(map[string]any{"V": "world"}); err != nil {
+		t.Fatalf("decode got an err: %s", err)
+	}
+	hasPtr, hasConcrete := false, false
+	for _, c := range *calls {
+		if c.from == "string" && c.to == "*string" {
+			hasPtr = true
+		}
+		if c.from == "string" && c.to == "string" {
+			hasConcrete = true
+		}
+	}
+	if !hasPtr || !hasConcrete {
+		t.Fatalf("expected in-place string -> *string and string -> string hook calls, got %#v", *calls)
+	}
+
+	// Held scalar, mismatching type: exactly one interface-boundary hook
+	// call for the new value, with no call against the stale string type.
+	hook, calls = collect()
+	decoder, err = NewDecoder(&DecoderConfig{DecodeHook: hook, Result: empty})
+	if err != nil {
+		t.Fatalf("NewDecoder got an err: %s", err)
+	}
+	if err := decoder.Decode(map[string]any{"V": 42}); err != nil {
+		t.Fatalf("decode got an err: %s", err)
+	}
+	boundaryCalls := 0
+	for _, c := range *calls {
+		if c.from == "int" && c.to == "interface {}" {
+			boundaryCalls++
+		}
+		if c.to == "string" || c.to == "*string" {
+			t.Fatalf("mismatching replacement must not recurse into stale string type, got call %#v", c)
+		}
+	}
+	if boundaryCalls != 1 {
+		t.Fatalf("expected exactly one int -> interface {} hook call, got %d in %#v", boundaryCalls, *calls)
+	}
+	if empty.V != 42 {
+		t.Fatalf("expected held value 42, got %#v", empty.V)
+	}
+}
+
 func TestDecode_BasicSquash(t *testing.T) {
 	t.Parallel()
 
